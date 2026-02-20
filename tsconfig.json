@@ -1,0 +1,19 @@
+{
+  "compilerOptions": {
+    "target": "ES2020",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "allowJs": true,
+    "checkJs": true,
+    "noEmit": true,
+    "lib": ["ES2020", "DOM"]
+  },
+  "include": [
+    "nanocode/**/*.ts",
+    "planning-agent/**/*.ts"
+  ]
+}
