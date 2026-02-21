@@ -4,6 +4,7 @@
 import json, os, subprocess, re, glob as glob_mod
 import urllib.request
 from pathlib import Path
+from datetime import datetime
 
 # ─── Config ──────────────────────────────────────────────────────────
 
@@ -63,21 +64,46 @@ def tools_schema():
         },
     }} for n, t in TOOLS.items()]
 
+# ─── Logging ─────────────────────────────────────────────────────────
+
+LOG_FILE = Path(__file__).resolve().parent / "agent_debug.log"
+
+def compact_json(obj, max_str_len=80):
+    """Keep all JSON keys, truncate string values to one line."""
+    if isinstance(obj, dict):
+        return {k: compact_json(v, max_str_len) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [compact_json(i, max_str_len) for i in obj]
+    if isinstance(obj, str):
+        s = obj.replace("\n", "\\n").replace("\r", "\\r")
+        return s[:max_str_len] + "..." if len(s) > max_str_len else s
+    return obj
+
+def dump_log(label, data):
+    ts = datetime.now().strftime("%H:%M:%S")
+    pretty = json.dumps(compact_json(data), indent=2, ensure_ascii=False)
+    with open(LOG_FILE, "a") as f:
+        f.write(f"\n{'='*60}\n[{ts}] {label}\n{'='*60}\n{pretty}\n")
+
 # ─── LLM Call ────────────────────────────────────────────────────────
 
 def call_llm(messages, system_prompt):
     url = API_URL.rstrip("/") + "/chat/completions"
-    body = json.dumps({
+    request_body = {
         "model": MODEL,
         "messages": [{"role": "system", "content": system_prompt}] + messages,
         "tools": tools_schema(),
-    }).encode()
+    }
+    dump_log("REQUEST", request_body)
+    body = json.dumps(request_body).encode()
     req = urllib.request.Request(url, data=body, headers={
         "Content-Type": "application/json",
         "Authorization": f"Bearer {API_KEY}",
     })
     with urllib.request.urlopen(req, timeout=120) as r:
-        return json.loads(r.read())["choices"][0]["message"]
+        resp = json.loads(r.read())
+    dump_log("RESPONSE", resp)
+    return resp["choices"][0]["message"]
 
 # ─── Agent Loop ──────────────────────────────────────────────────────
 

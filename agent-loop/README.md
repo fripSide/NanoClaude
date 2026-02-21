@@ -86,3 +86,4 @@ User input → LLM → tool calls? ─yes─→ execute tools → feed results b
 
 
 ### v2-伪代码
+planning -> todo -> execute -> review -> done
