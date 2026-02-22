@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 """Minimal agent loop — as close to the pseudocode as possible."""
 
-import json, os, subprocess, re, glob as glob_mod
+import json
+import os
+import subprocess
 import urllib.request
 from pathlib import Path
 from datetime import datetime
 
+
 # ─── Config ──────────────────────────────────────────────────────────
+
 
 def load_env():
     env_path = Path(__file__).resolve().parent.parent / ".env"
@@ -17,10 +21,12 @@ def load_env():
                 k, _, v = line.partition("=")
                 os.environ.setdefault(k.strip(), v.strip().strip('"'))
 
+
 load_env()
 API_URL = os.environ.get("API_URL", "")
 API_KEY = os.environ.get("OPENROUTER_KEY", "")
-MODEL   = os.environ.get("MODEL", "qwen3-max")
+MODEL = os.environ.get("MODEL", "qwen3-max")
+
 
 # ─── Tools ───────────────────────────────────────────────────────────
 
@@ -43,15 +49,17 @@ TOOLS = {
     "bash": {
         "desc": "Run a shell command (30s timeout)",
         "params": {"cmd": "string"},
-        "fn": lambda cmd: (lambda r: (r.stdout + r.stderr).strip() or "(empty)")(subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=30)),
+        "fn": lambda cmd: (lambda r: (r.stdout + r.stderr).strip() or "(empty)")(subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=30, check=True)),
     },
 }
+
 
 def execute_tool(name, args):
     try:
         return str(TOOLS[name]["fn"](**args))
     except Exception as e:
         return f"error: {e}"
+
 
 def tools_schema():
     return [{"type": "function", "function": {
@@ -64,9 +72,11 @@ def tools_schema():
         },
     }} for n, t in TOOLS.items()]
 
+
 # ─── Logging ─────────────────────────────────────────────────────────
 
 LOG_FILE = Path(__file__).resolve().parent / "agent_debug.log"
+
 
 def compact_json(obj, max_str_len=80):
     """Keep all JSON keys, truncate string values to one line."""
@@ -79,13 +89,16 @@ def compact_json(obj, max_str_len=80):
         return s[:max_str_len] + "..." if len(s) > max_str_len else s
     return obj
 
+
 def dump_log(label, data):
     ts = datetime.now().strftime("%H:%M:%S")
     pretty = json.dumps(compact_json(data), indent=2, ensure_ascii=False)
-    with open(LOG_FILE, "a") as f:
+    with open(LOG_FILE, "a", encoding="utf-8") as f:
         f.write(f"\n{'='*60}\n[{ts}] {label}\n{'='*60}\n{pretty}\n")
 
+
 # ─── LLM Call ────────────────────────────────────────────────────────
+
 
 def call_llm(messages, system_prompt):
     url = API_URL.rstrip("/") + "/chat/completions"
@@ -96,16 +109,22 @@ def call_llm(messages, system_prompt):
     }
     dump_log("REQUEST", request_body)
     body = json.dumps(request_body).encode()
-    req = urllib.request.Request(url, data=body, headers={
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {API_KEY}",
-    })
+    req = urllib.request.Request(
+        url,
+        data=body,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {API_KEY}"
+        }
+    )
     with urllib.request.urlopen(req, timeout=120) as r:
         resp = json.loads(r.read())
     dump_log("RESPONSE", resp)
     return resp["choices"][0]["message"]
 
+
 # ─── Agent Loop ──────────────────────────────────────────────────────
+
 
 def agent_loop(messages, system_prompt):
     """Call LLM in a loop, executing tool calls until the model stops."""
@@ -130,7 +149,9 @@ def agent_loop(messages, system_prompt):
             print(f"   → {result[:100]}")
             messages.append({"role": "tool", "tool_call_id": tc["id"], "content": result})
 
+
 # ─── Main ────────────────────────────────────────────────────────────
+
 
 def main():
     print(f"agent-loop | {MODEL}\n")
@@ -154,6 +175,7 @@ def main():
         messages.append({"role": "user", "content": user_input})
         agent_loop(messages, system_prompt)
         print()
+
 
 if __name__ == "__main__":
     main()

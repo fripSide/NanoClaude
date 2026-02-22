@@ -1,12 +1,20 @@
-import json, os, subprocess
+import json
+import os
+import subprocess
+import sys
 import urllib.request
 from pathlib import Path
 from datetime import datetime
 
+
 WORKDIR = Path.cwd()
-SYSTEM = f"You are a coding agent at {WORKDIR}. Use tools to solve tasks. Act, don't explain."
+SYSTEM = f"""You are a coding agent at {WORKDIR}.
+Use the todo tool to plan multi-step tasks. Mark in_progress before starting, completed when done.
+Prefer tools over prose."""
+
 
 # ─── Config ──────────────────────────────────────────────────────────
+
 
 def load_env():
     env_path = Path(__file__).resolve().parent.parent / ".env"
@@ -20,7 +28,8 @@ def load_env():
 load_env()
 API_URL = os.environ.get("API_URL", "")
 API_KEY = os.environ.get("OPENROUTER_KEY", "")
-MODEL   = os.environ.get("MODEL", "qwen3-max")
+MODEL = os.environ.get("MODEL", "qwen3-max")
+
 
 # ─── Logging ─────────────────────────────────────────────────────────
 
@@ -41,9 +50,15 @@ def compact_json(obj, max_str_len=80):
 
 def dump_log(label, data):
     ts = datetime.now().strftime("%H:%M:%S")
-    pretty = json.dumps(compact_json(data), indent=2, ensure_ascii=False)
-    with open(LOG_FILE, "a") as f:
+    log_data = data.copy() if isinstance(data, dict) else data
+    if isinstance(log_data, dict) and isinstance(log_data.get("tools"), list):
+        tools = log_data["tools"]
+        names = [t.get("function", {}).get("name", "?") for t in tools if isinstance(t, dict)]
+        log_data["tools"] = f"[{len(tools)} tools: {', '.join(names)}]"
+    pretty = json.dumps(compact_json(log_data), indent=2, ensure_ascii=False)
+    with open(LOG_FILE, "a", encoding="utf-8") as f:
         f.write(f"\n{'='*60}\n[{ts}] {label}\n{'='*60}\n{pretty}\n")
+
 
 # ─── LLM Call ────────────────────────────────────────────────────────
 
@@ -124,7 +139,74 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "todo",
+            "description": "Update the todo list.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "items": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "id": {"type": "integer"},
+                                "text": {"type": "string"},
+                                "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]},
+                            },
+                            "required": ["id", "text", "status"],
+                        },
+                    },
+                },
+                "required": ["items"],
+            },
+        },
+    },
 ]
+
+
+class TodoManager:
+    def __init__(self):
+        self.items = []
+
+    def update(self, items: list) -> str:
+        if len(items) > 20:
+            raise ValueError("Max 20 todos allowed")
+        
+        validated = []
+        for i, item in enumerate(items):
+            text = str(item.get("text", "")).strip()
+            status = str(item.get("status", "pending")).lower()
+            item_id = int(item.get("id", i + 1))
+            
+            if not text:
+                raise ValueError(f"Item {item_id}: text required")
+            if status not in ("pending", "in_progress", "completed"):
+                raise ValueError(f"Item {item_id}: invalid status '{status}'")
+                
+            validated.append({"id": item_id, "text": text, "status": status})
+            
+        if sum(1 for v in validated if v["status"] == "in_progress") > 1:
+            raise ValueError("Only one todo can be in progress at a time")
+            
+        self.items = validated
+        return self.render()
+
+    def render(self) -> str:
+        if not self.items:
+            return "No todos."
+        lines = []
+        for item in self.items:
+            marker = {"pending": "[ ]", "in_progress": "[>]", "completed": "[x]"}[item["status"]]
+            lines.append(f"{marker} #{item['id']}: {item['text']}")
+        done = sum(1 for t in self.items if t["status"] == "completed")
+        lines.append(f"\n({done}/{len(self.items)} completed)")
+        return "\n".join(lines)
+
+TODO = TodoManager()
+
 
 def safe_path(p: str) -> Path:
     path = (WORKDIR / p).resolve()
@@ -135,13 +217,13 @@ def safe_path(p: str) -> Path:
 
 def run_read(path: str, limit: int) -> str:
     try:
-        file_cotent = safe_path(path).read_text(encoding="utf-8", errors="ignore")
-        lines = file_cotent.splitlines()
+        lines = safe_path(path).read_text(encoding="utf-8", errors="ignore").splitlines()
         if limit and limit < len(lines):
             lines = lines[:limit] + [f"... ({len(lines) - limit} more lines)"]
         return "\n".join(lines)[:50000]
     except Exception as e:
         return f"Error: {e}"
+
 
 def run_write(path: str, content: str) -> str:
     try:
@@ -152,21 +234,20 @@ def run_write(path: str, content: str) -> str:
     except Exception as e:
         return f"Error: {e}"
 
+
 def run_edit(path: str, before: str, after: str) -> str:
     try:
         fp = safe_path(path)
         content = fp.read_text(encoding="utf-8", errors="ignore")
-        new_content = content.replace(before, after)
-        if new_content == content:
-            return "No change detected"
-        fp.write_text(new_content)
+        if before not in content:
+            return "Error: old_text not found in file"
+        fp.write_text(content.replace(before, after))
         return f"Edited {path}"
     except Exception as e:
         return f"Error: {e}"
 
 def run_bash(command: str) -> str:
-    dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
-    if any(d in command for d in dangerous):
+    if any(d in command for d in ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]):
         return "Error: Dangerous command blocked"
     try:
         result = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=120)
@@ -175,24 +256,36 @@ def run_bash(command: str) -> str:
     except Exception as e:
         return str(e)
 
+
 TOOL_HANDLERS = {
-    "bash":       lambda **kw: run_bash(kw["command"]),
-    "read_file":  lambda **kw: run_read(kw["path"], kw.get("limit")),
+    "bash": lambda **kw: run_bash(kw["command"]),
+    "read_file": lambda **kw: run_read(kw["path"], kw.get("limit")),
     "write_file": lambda **kw: run_write(kw["path"], kw["content"]),
-    "edit_file":  lambda **kw: run_edit(kw["path"], kw["old_text"], kw["new_text"]),
+    "edit_file": lambda **kw: run_edit(kw["path"], kw["old_text"], kw["new_text"]),
+    "todo": lambda **kw: TODO.update(kw["items"]),
 }
 
+
 def agent_loop(messages, system_prompt):
+    rounds_since_todo = 0
     while True:
+        if rounds_since_todo > 3:
+            last = messages[-1]
+            if isinstance(last.get("content"), str) and "<reminder>" not in last["content"]:
+                last["content"] += "\n<reminder>Update your todos.</reminder>"
+                
         response = call_llm(messages, system_prompt)
-        content = response.get("content")
-        if content:
+        if content := response.get("content"):
             print(f"\n💬 {content}")
+            
         tool_calls = response.get("tool_calls", [])
         if not tool_calls:
             messages.append({"role": "assistant", "content": content})
             return
+            
         messages.append(response)
+        used_todo = False
+        
         for tc in tool_calls:
             name = tc["function"]["name"]
             args = json.loads(tc["function"].get("arguments", "{}"))
@@ -205,8 +298,15 @@ def agent_loop(messages, system_prompt):
                     result = tool(**args)
                 except Exception as e:
                     result = f"Error: {e}"
-            print(f"   → {result[:100]}")
-            messages.append({"role": "tool", "tool_call_id": tc["id"], "content": result})
+                
+            print(f"> {name}: {str(result)[:200]}")
+            messages.append({"role": "tool", "tool_call_id": tc["id"], "content": str(result)})
+            
+            if name == "todo":
+                used_todo = True
+                # sys.exit(0)
+                
+        rounds_since_todo = 0 if used_todo else rounds_since_todo + 1
 
 
 if __name__ == "__main__":

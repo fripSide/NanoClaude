@@ -1,12 +1,17 @@
-
-import json, os, subprocess
+import json
+import os
+import subprocess
 import urllib.request
 from pathlib import Path
 from datetime import datetime
 
-SYSTEM_PROMPT = f"You are a coding agent at {os.getcwd()}. Use bash to solve tasks. Act, don't explain."
+
+WORKDIR = Path.cwd()
+SYSTEM = f"You are a coding agent at {WORKDIR}. Use tools to solve tasks. Act, don't explain."
+
 
 # ─── Config ──────────────────────────────────────────────────────────
+
 
 def load_env():
     env_path = Path(__file__).resolve().parent.parent / ".env"
@@ -20,11 +25,14 @@ def load_env():
 load_env()
 API_URL = os.environ.get("API_URL", "")
 API_KEY = os.environ.get("OPENROUTER_KEY", "")
-MODEL   = os.environ.get("MODEL", "qwen3-max")
+MODEL = os.environ.get("MODEL", "qwen3-max")
+
 
 # ─── Logging ─────────────────────────────────────────────────────────
 
 LOG_FILE = Path(__file__).resolve().parent / "agent_debug.log"
+if os.path.exists(LOG_FILE):
+    os.remove(LOG_FILE)
 
 def compact_json(obj, max_str_len=80):
     """Keep all JSON keys, truncate string values to one line."""
@@ -42,6 +50,7 @@ def dump_log(label, data):
     pretty = json.dumps(compact_json(data), indent=2, ensure_ascii=False)
     with open(LOG_FILE, "a") as f:
         f.write(f"\n{'='*60}\n[{ts}] {label}\n{'='*60}\n{pretty}\n")
+
 
 # ─── LLM Call ────────────────────────────────────────────────────────
 
@@ -67,7 +76,7 @@ TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "run_bash",
+            "name": "bash",
             "description": "Run a shell command.",
             "parameters": {
                 "type": "object",
@@ -75,8 +84,95 @@ TOOLS = [
                 "required": ["command"],
             },
         },
-    }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": "Read a file.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "limit": {"type": "integer"},
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "write_file",
+            "description": "Write a file.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "content": {"type": "string"},
+                },
+                "required": ["path", "content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "edit_file",
+            "description": "Edit a file.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "old_text": {"type": "string"},
+                    "new_text": {"type": "string"},
+                },
+                "required": ["path", "old_text", "new_text"],
+            },
+        },
+    },
 ]
+
+
+def safe_path(p: str) -> Path:
+    path = (WORKDIR / p).resolve()
+    if not path.is_relative_to(WORKDIR):
+        raise ValueError(f"Path escapes workspace: {p}")
+    return path
+
+
+def run_read(path: str, limit: int) -> str:
+    try:
+        file_cotent = safe_path(path).read_text(encoding="utf-8", errors="ignore")
+        lines = file_cotent.splitlines()
+        if limit and limit < len(lines):
+            lines = lines[:limit] + [f"... ({len(lines) - limit} more lines)"]
+        return "\n".join(lines)[:50000]
+    except Exception as e:
+        return f"Error: {e}"
+
+
+def run_write(path: str, content: str) -> str:
+    try:
+        fp = safe_path(path)
+        fp.parent.mkdir(parents=True, exist_ok=True)
+        fp.write_text(content)
+        return f"Wrote {len(content)} bytes to {path}"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+def run_edit(path: str, before: str, after: str) -> str:
+    try:
+        fp = safe_path(path)
+        content = fp.read_text(encoding="utf-8", errors="ignore")
+        new_content = content.replace(before, after)
+        if new_content == content:
+            return "No change detected"
+        fp.write_text(new_content)
+        return f"Edited {path}"
+    except Exception as e:
+        return f"Error: {e}"
 
 
 def run_bash(command: str) -> str:
@@ -90,7 +186,16 @@ def run_bash(command: str) -> str:
     except Exception as e:
         return str(e)
 
-def agent_loop(messages: list[dict], system_prompt: str):
+
+TOOL_HANDLERS = {
+    "bash": lambda **kw: run_bash(kw["command"]),
+    "read_file": lambda **kw: run_read(kw["path"], kw.get("limit")),
+    "write_file": lambda **kw: run_write(kw["path"], kw["content"]),
+    "edit_file": lambda **kw: run_edit(kw["path"], kw["old_text"], kw["new_text"]),
+}
+
+
+def agent_loop(messages, system_prompt):
     while True:
         response = call_llm(messages, system_prompt)
         content = response.get("content")
@@ -105,25 +210,32 @@ def agent_loop(messages: list[dict], system_prompt: str):
             name = tc["function"]["name"]
             args = json.loads(tc["function"].get("arguments", "{}"))
             print(f"\n🔧 {name}({args})")
-            result = run_bash(args["command"])
+            tool = TOOL_HANDLERS.get(name)
+            if not tool:
+                result = f"Error: Unknown tool {name}"
+            else:
+                try:
+                    result = tool(**args)
+                except Exception as e:
+                    result = f"Error: {e}"
             print(f"   → {result[:100]}")
             messages.append({"role": "tool", "tool_call_id": tc["id"], "content": result})
 
 
 if __name__ == "__main__":
-    history = []
+    messages = []
+
     while True:
         try:
-            query = input("\033[36ms01 >> \033[0m")
+            user_input = input("❯ ").strip()
         except (EOFError, KeyboardInterrupt):
             break
-        if query.strip().lower() in ("q", "exit", ""):
+        if not user_input:
+            continue
+        if user_input in ("/q", "exit"):
             break
-        history.append({"role": "user", "content": query})
-        agent_loop(history, SYSTEM_PROMPT)
-        response_content = history[-1]["content"]
-        if isinstance(response_content, list):
-            for block in response_content:
-                if hasattr(block, "text"):
-                    print(block.text)
-        print()
+
+        messages.append({"role": "user", "content": user_input})
+        agent_loop(messages, SYSTEM)
+
+    print("\nBye.")
