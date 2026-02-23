@@ -1,30 +1,24 @@
 import json
 import os
+import re
 import subprocess
 import sys
 import urllib.request
 from pathlib import Path
+import time
 from datetime import datetime
+from dotenv import load_dotenv
 
+WORKDIR = Path.cwd()
+SYSTEM = f"You are a coding agent at {WORKDIR}. Use tools to solve tasks."
 
-# WORKDIR = Path.cwd()
-WORKDIR = Path("/Users/fripside/Dev/Research/IoTPoC")
-SYSTEM = f"You are a coding agent at {WORKDIR}. Use the task tool to delegate exploration or subtasks."
-SUBAGENT_SYSTEM = f"You are a coding subagent at {WORKDIR}. Complete the given task, then summarize your findings."
+THRESHOLD = 50000
+TRANSCRIPT_DIR = WORKDIR / ".transcripts"
+KEEP_RECENT = 3
 
 # ─── Config ──────────────────────────────────────────────────────────
 
-
-def load_env():
-    env_path = Path(__file__).resolve().parent.parent / ".env"
-    if env_path.exists():
-        for line in env_path.read_text().splitlines():
-            line = line.strip()
-            if line and not line.startswith("#") and "=" in line:
-                k, _, v = line.partition("=")
-                os.environ.setdefault(k.strip(), v.strip().strip('"'))
-
-load_env()
+load_dotenv()
 API_URL = os.environ.get("API_URL", "")
 API_KEY = os.environ.get("OPENROUTER_KEY", "")
 MODEL = os.environ.get("MODEL", "qwen3-max")
@@ -33,8 +27,11 @@ MODEL = os.environ.get("MODEL", "qwen3-max")
 # ─── Logging ─────────────────────────────────────────────────────────
 
 LOG_FILE = Path(__file__).resolve().parent / "agent_debug.log"
+CONV_LOG_FILE = Path(__file__).resolve().parent / "agent_conv.log"
 if os.path.exists(LOG_FILE):
     os.remove(LOG_FILE)
+if os.path.exists(CONV_LOG_FILE):
+    os.remove(CONV_LOG_FILE)
 
 def compact_json(obj, max_str_len=80):
     """Keep all JSON keys, truncate string values to one line."""
@@ -58,6 +55,31 @@ def dump_log(label, data):
     with open(LOG_FILE, "a", encoding="utf-8") as f:
         f.write(f"\n{'='*60}\n[{ts}] {label}\n{'='*60}\n{pretty}\n")
 
+def dump_conv_log(messages, system_prompt=""):
+    """Write conversation log, splitting turns with ----."""
+    with open(CONV_LOG_FILE, "a", encoding="utf-8") as f:
+        if system_prompt:
+            f.write(f"[system]\n{system_prompt}\n")
+        for msg in messages:
+            role = msg.get("role", "unknown")
+            if role == "system":
+                continue
+            if role == "user":
+                f.write(f"\n----\n[user]\n{msg.get('content', '')}\n")
+            elif role == "tool":
+                tool_id = msg.get("tool_call_id", "")
+                content = msg.get("content", "")
+                f.write(f"[tool] {tool_id}\n{content}\n")
+            elif role == "assistant":
+                content = (msg.get("content", "") or "").replace("\n\n", "\n")
+                f.write(f"[assistant]\n{content}\n")
+                for tc in msg.get("tool_calls", []):
+                    name = tc.get("function", {}).get("name", "?")
+                    args = tc.get("function", {}).get("arguments", "")
+                    f.write(f"[tool_call] {name}\n{args}\n")
+            else:
+                f.write(f"[{role}]\n{msg.get('content', '')}\n")
+
 
 # ─── LLM Call ────────────────────────────────────────────────────────
 
@@ -79,7 +101,7 @@ def call_llm(messages, system_prompt, tools):
     dump_log("RESPONSE", resp)
     return resp["choices"][0]["message"]
 
-CHILD_TOOLS = [
+TOOLS = [
     {
         "type": "function",
         "function": {
@@ -138,32 +160,21 @@ CHILD_TOOLS = [
             },
         },
     },
-]
-
-PARENT_TOOLS = CHILD_TOOLS + [
     {
         "type": "function",
         "function": {
-            "name": "task",
-            "description": "Spawn a subagent with fresh context.",
+            "name": "compact",
+            "description": "Trigger manual conversation compression.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "prompt": {"type": "string"}
+                    "focus": {"type": "string", "description": "What to preserve in the summary"},
                 },
-                "required": ["prompt"],
             },
         },
     },
 ]
 
-TOOL_HANDLERS = {
-    "bash": lambda **kw: run_bash(kw["command"]),
-    "read_file": lambda **kw: run_read(kw["path"], kw.get("limit")),
-    "write_file": lambda **kw: run_write(kw["path"], kw["content"]),
-    "edit_file": lambda **kw: run_edit(kw["path"], kw["old_text"], kw["new_text"]),
-    "task": lambda **kw: run_subagent(kw["prompt"]),
-}
 
 def safe_path(p: str) -> Path:
     path = (WORKDIR / p).resolve()
@@ -213,44 +224,117 @@ def run_bash(command: str) -> str:
     except Exception as e:
         return str(e)
 
-def run_subagent(prompt: str) -> str:
-    sub_meesage = [{"role": "user", "content": prompt}]
-    # at most 30 rounds
-    for _ in range(30):
-        response = call_llm(sub_meesage, SUBAGENT_SYSTEM, CHILD_TOOLS)
-        tool_calls = response.get("tool_calls", [])
-        if not tool_calls:
-            break
-        sub_meesage.append(response)
-        for tc in tool_calls:
-            name = tc["function"]["name"]
-            args = json.loads(tc["function"].get("arguments", "{}"))
-            print(f"\n🔧 subagent -> {name}({args})")
-            tool = TOOL_HANDLERS.get(name)
-            if not tool:
-                result = f"Error: Unknown tool {name}"
-            else:
-                try:
-                    result = tool(**args)
-                except Exception as e:
-                    result = f"Error: {e}"
-            print(f"   → {result[:100]}")
-            sub_meesage.append({"role": "tool", "tool_call_id": tc["id"], "content": result})  
 
-    # Only return the last message
-    return "".join(b.text for b in response.content if hasattr(b, "text")) or "(no summary)" 
+TOOL_HANDLERS = {
+    "bash": lambda **kw: run_bash(kw["command"]),
+    "read_file": lambda **kw: run_read(kw["path"], kw.get("limit")),
+    "write_file": lambda **kw: run_write(kw["path"], kw["content"]),
+    "edit_file": lambda **kw: run_edit(kw["path"], kw["old_text"], kw["new_text"]),
+    "compact": lambda **kw: "",
+}
+
+# 保持最后3调详细消息
+def micro_compact(messages: list) -> list:
+    """Merge old assistant+tool pairs into compact summaries, keep last KEEP_RECENT detailed."""
+    # Find all (assistant_idx, tool_idx) pairs
+    pairs = []
+    i = 0
+    while i < len(messages):
+        msg = messages[i]
+        if msg.get("role") == "assistant" and msg.get("tool_calls"):
+            # Collect following tool messages that belong to this assistant turn
+            tc_ids = {tc["id"] for tc in msg["tool_calls"]}
+            tool_indices = []
+            for j in range(i + 1, len(messages)):
+                if messages[j].get("role") == "tool" and messages[j].get("tool_call_id") in tc_ids:
+                    tool_indices.append(j)
+                elif messages[j].get("role") != "tool":
+                    break
+            if tool_indices:
+                pairs.append((i, tool_indices))
+        i += 1
+
+    if len(pairs) <= KEEP_RECENT:
+        return messages
+
+    # Pairs to compact (all except last KEEP_RECENT)
+    to_compact = pairs[:-KEEP_RECENT]
+    remove_indices = set()
+    for ast_idx, tool_idxs in to_compact:
+        ast_msg = messages[ast_idx]
+        # Build compact summary from tool_calls + results
+        parts = []
+        for tc in ast_msg.get("tool_calls", []):
+            name = tc["function"]["name"]
+            args = tc["function"].get("arguments", "")
+            # Find matching tool result
+            result = ""
+            for tidx in tool_idxs:
+                if messages[tidx].get("tool_call_id") == tc["id"]:
+                    result = messages[tidx].get("content", "")[:10]
+                    break
+            parts.append(f"[{name}({args[:60]})] → \n{result}")
+        # Replace assistant message with compact version
+        summary = "; ".join(parts)
+        original_content = ast_msg.get("content") or ""
+        if original_content:
+            summary = original_content[:80] + "\n" + summary
+        messages[ast_idx] = {"role": "assistant", "content": summary}
+        # Mark tool messages for removal
+        remove_indices.update(tool_idxs)
+
+    # Remove old tool messages
+    return [m for i, m in enumerate(messages) if i not in remove_indices]
+
+
+def estimate_tokens(messages: list) -> int:
+    """Rough token count: ~4 chars per token."""
+    return len(str(messages)) // 4
+
+# auto compact
+def auto_compact(messages: list) -> list:
+    # Save full transcript to disk
+    TRANSCRIPT_DIR.mkdir(exist_ok=True)
+    transcript_path = TRANSCRIPT_DIR / f"transcript_{int(time.time())}.jsonl"
+    with open(transcript_path, "w") as f:
+        for msg in messages:
+            f.write(json.dumps(msg, default=str) + "\n")
+    print(f"[transcript saved: {transcript_path}]")
+    # Ask LLM to summarize
+    conversation_text = json.dumps(messages, default=str)[:80000]
+    prompt = """
+        Summarize this conversation for continuity. Include: 
+        1) What was accomplished, 
+        2) Current state, 
+        3) Key decisions made. 
+        Be concise but preserve critical details.\n\n
+    """
+    response = call_llm(messages, prompt + conversation_text, [])
+    summary = response.get("content")
+    # Replace all messages with compressed summary
+    return [
+        {"role": "user", "content": f"[Conversation compressed. Transcript: {transcript_path}]\n\n{summary}"},
+        {"role": "assistant", "content": "Understood. I have the context from the summary. Continuing."},
+    ]
 
 def agent_loop(messages, system_prompt):
      while True:
-        response = call_llm(messages, system_prompt, PARENT_TOOLS)
+        messages = micro_compact(messages)
+        if estimate_tokens(messages) > THRESHOLD:
+            print("[auto_compact triggered]")
+            messages[:] = auto_compact(messages)
+        
+        response = call_llm(messages, system_prompt, TOOLS)
         content = response.get("content")
         if content:
             print(f"\n💬 {content}")
         tool_calls = response.get("tool_calls", [])
         if not tool_calls:
             messages.append({"role": "assistant", "content": content})
+            dump_conv_log(messages, system_prompt)
             return
         messages.append(response)
+        manual_compact = False
         for tc in tool_calls:
             name = tc["function"]["name"]
             args = json.loads(tc["function"].get("arguments", "{}"))
@@ -263,12 +347,20 @@ def agent_loop(messages, system_prompt):
                     result = tool(**args)
                 except Exception as e:
                     result = f"Error: {e}"
+            if name == "compact":
+                manual_compact = True
             print(f"   → {result[:100]}")
             messages.append({"role": "tool", "tool_call_id": tc["id"], "content": result})  
+        
+        # Layer 3: manual compact triggered by the compact tool
+        if manual_compact:
+            print("[manual compact]")
+            messages[:] = auto_compact(messages)
+        dump_conv_log(messages, system_prompt)
 
 
 if __name__ == "__main__":
-    messages = []
+    history = []
 
     while True:
         try:
@@ -280,7 +372,7 @@ if __name__ == "__main__":
         if user_input in ("/q", "exit"):
             break
 
-        messages.append({"role": "user", "content": user_input})
-        agent_loop(messages, SYSTEM)
+        history.append({"role": "user", "content": user_input})
+        agent_loop(history, SYSTEM)
 
     print("\nBye.")

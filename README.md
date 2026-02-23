@@ -1,6 +1,8 @@
 目标：
 重现 pi-agent 这样的通用Agent workflow
 
+用qwen openai api。
+
 当前：claude-code  
 https://learn-claude-agents.vercel.app/en/s01/
 

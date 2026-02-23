@@ -1,30 +1,21 @@
 import json
 import os
+import re
 import subprocess
 import sys
 import urllib.request
 from pathlib import Path
 from datetime import datetime
+from dotenv import load_dotenv
+
+WORKDIR = Path.cwd()
 
 
-# WORKDIR = Path.cwd()
-WORKDIR = Path("/Users/fripside/Dev/Research/IoTPoC")
-SYSTEM = f"You are a coding agent at {WORKDIR}. Use the task tool to delegate exploration or subtasks."
-SUBAGENT_SYSTEM = f"You are a coding subagent at {WORKDIR}. Complete the given task, then summarize your findings."
+SKILLS_DIR = WORKDIR / "skills"
 
 # ─── Config ──────────────────────────────────────────────────────────
 
-
-def load_env():
-    env_path = Path(__file__).resolve().parent.parent / ".env"
-    if env_path.exists():
-        for line in env_path.read_text().splitlines():
-            line = line.strip()
-            if line and not line.startswith("#") and "=" in line:
-                k, _, v = line.partition("=")
-                os.environ.setdefault(k.strip(), v.strip().strip('"'))
-
-load_env()
+load_dotenv()
 API_URL = os.environ.get("API_URL", "")
 API_KEY = os.environ.get("OPENROUTER_KEY", "")
 MODEL = os.environ.get("MODEL", "qwen3-max")
@@ -33,8 +24,11 @@ MODEL = os.environ.get("MODEL", "qwen3-max")
 # ─── Logging ─────────────────────────────────────────────────────────
 
 LOG_FILE = Path(__file__).resolve().parent / "agent_debug.log"
+CONV_LOG_FILE = Path(__file__).resolve().parent / "agent_conv.log"
 if os.path.exists(LOG_FILE):
     os.remove(LOG_FILE)
+if os.path.exists(CONV_LOG_FILE):
+    os.remove(CONV_LOG_FILE)
 
 def compact_json(obj, max_str_len=80):
     """Keep all JSON keys, truncate string values to one line."""
@@ -58,6 +52,31 @@ def dump_log(label, data):
     with open(LOG_FILE, "a", encoding="utf-8") as f:
         f.write(f"\n{'='*60}\n[{ts}] {label}\n{'='*60}\n{pretty}\n")
 
+def dump_conv_log(messages, system_prompt=""):
+    """Write conversation log, splitting turns with ----."""
+    with open(CONV_LOG_FILE, "a", encoding="utf-8") as f:
+        if system_prompt:
+            f.write(f"[system]\n{system_prompt}\n")
+        for msg in messages:
+            role = msg.get("role", "unknown")
+            if role == "system":
+                continue
+            if role == "user":
+                f.write(f"\n----\n[user]\n{msg.get('content', '')}\n")
+            elif role == "tool":
+                tool_id = msg.get("tool_call_id", "")
+                content = msg.get("content", "")
+                f.write(f"[tool] {tool_id}\n{content}\n")
+            elif role == "assistant":
+                content = (msg.get("content", "") or "").replace("\n\n", "\n")
+                f.write(f"[assistant]\n{content}\n")
+                for tc in msg.get("tool_calls", []):
+                    name = tc.get("function", {}).get("name", "?")
+                    args = tc.get("function", {}).get("arguments", "")
+                    f.write(f"[tool_call] {name}\n{args}\n")
+            else:
+                f.write(f"[{role}]\n{msg.get('content', '')}\n")
+
 
 # ─── LLM Call ────────────────────────────────────────────────────────
 
@@ -79,7 +98,63 @@ def call_llm(messages, system_prompt, tools):
     dump_log("RESPONSE", resp)
     return resp["choices"][0]["message"]
 
-CHILD_TOOLS = [
+
+class SkillLoader:
+
+    def __init__(self, skills_dir: Path):
+        self.skills = {}
+        for f in sorted(skills_dir.rglob("SKILL.md")):
+            name = f.parent.name
+            text = f.read_text()
+            meta, body = self._parse_frontmatter(text)
+            self.skills[name] = {
+                "meta": meta, "body": body
+            }
+    
+    def _parse_frontmatter(self, text: str) -> tuple[dict, str]:
+        match = re.match(
+            r"^---\n(.*?)\n---\n(.*)", text, re.DOTALL
+        )
+        if not match:
+            return {}, text
+        meta = {}
+        current_key = None
+        for line in match.group(1).strip().splitlines():
+            if line.startswith((" ", "\t")) and current_key:
+                # Indented continuation line (YAML block scalar)
+                meta[current_key] += " " + line.strip()
+            elif ":" in line:
+                key, val = line.split(":", 1)
+                current_key = key.strip()
+                val = val.strip()
+                if val == "|":
+                    meta[current_key] = ""
+                else:
+                    meta[current_key] = val
+        return meta, match.group(2).strip()
+
+
+    def get_skills_description(self) -> str:
+        lines = []
+        for name, skill in self.skills.items():
+            desc = skill["meta"].get("description", "")
+            lines.append(f"  - {name}: {desc}")
+        return "\n".join(lines)
+
+    def get_skill_content(self, name: str) -> str:
+        skill = self.skills.get(name)
+        if not skill:
+            raise ValueError(f"Skill '{name}' not found")
+        return f"<skill name='{name}'>{skill['body']}</skill>"
+
+
+SKILL_LOADER = SkillLoader(SKILLS_DIR)   
+SYSTEM = f"""You are a coding agent at {WORKDIR}.
+Use load_skill to access specialized knowledge before tackling unfamiliar topics.
+Skills available:
+{SKILL_LOADER.get_skills_description()}"""
+
+TOOLS = [
     {
         "type": "function",
         "function": {
@@ -138,32 +213,22 @@ CHILD_TOOLS = [
             },
         },
     },
-]
-
-PARENT_TOOLS = CHILD_TOOLS + [
     {
         "type": "function",
         "function": {
-            "name": "task",
-            "description": "Spawn a subagent with fresh context.",
+            "name": "load_skill",
+            "description": "Load specialized knowledge by name.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "prompt": {"type": "string"}
+                    "name": {"type": "string", "description": "Skill name to load"},
                 },
-                "required": ["prompt"],
+                "required": ["name"],
             },
         },
     },
 ]
 
-TOOL_HANDLERS = {
-    "bash": lambda **kw: run_bash(kw["command"]),
-    "read_file": lambda **kw: run_read(kw["path"], kw.get("limit")),
-    "write_file": lambda **kw: run_write(kw["path"], kw["content"]),
-    "edit_file": lambda **kw: run_edit(kw["path"], kw["old_text"], kw["new_text"]),
-    "task": lambda **kw: run_subagent(kw["prompt"]),
-}
 
 def safe_path(p: str) -> Path:
     path = (WORKDIR / p).resolve()
@@ -213,42 +278,25 @@ def run_bash(command: str) -> str:
     except Exception as e:
         return str(e)
 
-def run_subagent(prompt: str) -> str:
-    sub_meesage = [{"role": "user", "content": prompt}]
-    # at most 30 rounds
-    for _ in range(30):
-        response = call_llm(sub_meesage, SUBAGENT_SYSTEM, CHILD_TOOLS)
-        tool_calls = response.get("tool_calls", [])
-        if not tool_calls:
-            break
-        sub_meesage.append(response)
-        for tc in tool_calls:
-            name = tc["function"]["name"]
-            args = json.loads(tc["function"].get("arguments", "{}"))
-            print(f"\n🔧 subagent -> {name}({args})")
-            tool = TOOL_HANDLERS.get(name)
-            if not tool:
-                result = f"Error: Unknown tool {name}"
-            else:
-                try:
-                    result = tool(**args)
-                except Exception as e:
-                    result = f"Error: {e}"
-            print(f"   → {result[:100]}")
-            sub_meesage.append({"role": "tool", "tool_call_id": tc["id"], "content": result})  
 
-    # Only return the last message
-    return "".join(b.text for b in response.content if hasattr(b, "text")) or "(no summary)" 
+TOOL_HANDLERS = {
+    "bash": lambda **kw: run_bash(kw["command"]),
+    "read_file": lambda **kw: run_read(kw["path"], kw.get("limit")),
+    "write_file": lambda **kw: run_write(kw["path"], kw["content"]),
+    "edit_file": lambda **kw: run_edit(kw["path"], kw["old_text"], kw["new_text"]),
+    "load_skill": lambda **kw: SKILL_LOADER.get_skill_content(kw["name"]),
+}
 
 def agent_loop(messages, system_prompt):
      while True:
-        response = call_llm(messages, system_prompt, PARENT_TOOLS)
+        response = call_llm(messages, system_prompt, TOOLS)
         content = response.get("content")
         if content:
             print(f"\n💬 {content}")
         tool_calls = response.get("tool_calls", [])
         if not tool_calls:
             messages.append({"role": "assistant", "content": content})
+            dump_conv_log(messages, system_prompt)
             return
         messages.append(response)
         for tc in tool_calls:
@@ -265,10 +313,12 @@ def agent_loop(messages, system_prompt):
                     result = f"Error: {e}"
             print(f"   → {result[:100]}")
             messages.append({"role": "tool", "tool_call_id": tc["id"], "content": result})  
+        dump_conv_log(messages, system_prompt)
 
 
 if __name__ == "__main__":
-    messages = []
+    history = []
+  
 
     while True:
         try:
@@ -280,7 +330,7 @@ if __name__ == "__main__":
         if user_input in ("/q", "exit"):
             break
 
-        messages.append({"role": "user", "content": user_input})
-        agent_loop(messages, SYSTEM)
+        history.append({"role": "user", "content": user_input})
+        agent_loop(history, SYSTEM)
 
     print("\nBye.")
