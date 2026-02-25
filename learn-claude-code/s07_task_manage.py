@@ -10,11 +10,10 @@ from datetime import datetime
 from dotenv import load_dotenv
 
 WORKDIR = Path.cwd()
-SYSTEM = f"You are a coding agent at {WORKDIR}. Use tools to solve tasks."
+SYSTEM = f"You are a coding agent at {WORKDIR}. Use task tools to plan and track work."
 
-THRESHOLD = 50000
-TRANSCRIPT_DIR = WORKDIR / ".transcripts"
-KEEP_RECENT = 3
+
+TASK_DIR = WORKDIR / ".tasks"
 
 # ─── Config ──────────────────────────────────────────────────────────
 
@@ -23,6 +22,88 @@ API_URL = os.environ.get("API_URL", "")
 API_KEY = os.environ.get("OPENROUTER_KEY", "")
 MODEL = os.environ.get("MODEL", "qwen3-max")
 
+class TaskManager:
+
+    def __init__(self, task_dir: Path):
+        self.dir = task_dir
+        self.dir.mkdir(exist_ok=True)
+        self._next_id = self._max_id() + 1
+
+    def _max_id(self) -> int:
+        ids = [int(f.stem.split("_")[1]) for f in self.dir.glob("task_*.json")]
+        return max(ids) if ids else 0
+
+    def _load(self, task_id: int) -> dict:
+        path = self.dir / f"task_{task_id}.json"
+        if not path.exists():
+            raise ValueError(f"Task {task_id} not found")
+        return json.loads(path.read_text())
+
+    def _save(self, task: dict):
+        path = self.dir / f"task_{task['id']}.json"
+        path.write_text(json.dumps(task, indent=2))
+
+    def create(self, subject: str, description: str = "") -> str:
+        task = {
+            "id": self._next_id, "subject": subject, "description": description,
+            "status": "pending", "blockedBy": [], "blocks": [], "owner": "",
+        }
+        self._save(task)
+        self._next_id += 1
+        return json.dumps(task, indent=2)
+
+    def get(self, task_id: int) -> str:
+        return json.dumps(self._load(task_id), indent=2)
+
+    def update(self, task_id: int, status: str = None,
+               add_blocked_by: list = None, add_blocks: list = None) -> str:
+        task = self._load(task_id)
+        if status:
+            if status not in ("pending", "in_progress", "completed"):
+                raise ValueError(f"Invalid status: {status}")
+            task["status"] = status
+            # When a task is completed, remove it from all other tasks' blockedBy
+            if status == "completed":
+                self._clear_dependency(task_id)
+        if add_blocked_by:
+            task["blockedBy"] = list(set(task["blockedBy"] + add_blocked_by))
+        if add_blocks:
+            task["blocks"] = list(set(task["blocks"] + add_blocks))
+            # Bidirectional: also update the blocked tasks' blockedBy lists
+            for blocked_id in add_blocks:
+                try:
+                    blocked = self._load(blocked_id)
+                    if task_id not in blocked["blockedBy"]:
+                        blocked["blockedBy"].append(task_id)
+                        self._save(blocked)
+                except ValueError:
+                    pass
+        self._save(task)
+        return json.dumps(task, indent=2)
+
+    def _clear_dependency(self, completed_id: int):
+        """Remove completed_id from all other tasks' blockedBy lists."""
+        for f in self.dir.glob("task_*.json"):
+            task = json.loads(f.read_text())
+            if completed_id in task.get("blockedBy", []):
+                task["blockedBy"].remove(completed_id)
+                self._save(task)
+
+    def list_all(self) -> str:
+        tasks = []
+        for f in sorted(self.dir.glob("task_*.json")):
+            tasks.append(json.loads(f.read_text()))
+        if not tasks:
+            return "No tasks."
+        lines = []
+        for t in tasks:
+            marker = {"pending": "[ ]", "in_progress": "[>]", "completed": "[x]"}.get(t["status"], "[?]")
+            blocked = f" (blocked by: {t['blockedBy']})" if t.get("blockedBy") else ""
+            lines.append(f"{marker} #{t['id']}: {t['subject']}{blocked}")
+        return "\n".join(lines)
+
+
+TASKS = TaskManager(TASK_DIR)
 
 # ─── Logging ─────────────────────────────────────────────────────────
 
@@ -163,13 +244,54 @@ TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "compact",
-            "description": "Trigger manual conversation compression.",
+            "name": "task_create",
+            "description": "Create a new task.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "focus": {"type": "string", "description": "What to preserve in the summary"},
+                    "subject": {"type": "string"},
+                    "description": {"type": "string"},
                 },
+                "required": ["subject"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "task_update",
+            "description": "Update a task's status or dependencies.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task_id": {"type": "integer"},
+                    "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]},
+                    "addBlockedBy": {"type": "array", "items": {"type": "integer"}},
+                    "addBlocks": {"type": "array", "items": {"type": "integer"}},
+                },
+                "required": ["task_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "task_list",
+            "description": "List all tasks with status summary.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "task_get",
+            "description": "Get full details of a task by ID.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task_id": {"type": "integer"},
+                },
+                "required": ["task_id"],
             },
         },
     },
@@ -230,100 +352,14 @@ TOOL_HANDLERS = {
     "read_file": lambda **kw: run_read(kw["path"], kw.get("limit")),
     "write_file": lambda **kw: run_write(kw["path"], kw["content"]),
     "edit_file": lambda **kw: run_edit(kw["path"], kw["old_text"], kw["new_text"]),
-    "compact": lambda **kw: "",
+    "task_create": lambda **kw: TASKS.create(kw["subject"], kw.get("description", "")),
+    "task_update": lambda **kw: TASKS.update(kw["task_id"], kw.get("status"), kw.get("addBlockedBy"), kw.get("addBlocks")),
+    "task_list":   lambda **kw: TASKS.list_all(),
+    "task_get":    lambda **kw: TASKS.get(kw["task_id"]),
 }
 
-# 保持最后3调详细消息
-def micro_compact(messages: list) -> list:
-    """Merge old assistant+tool pairs into compact summaries, keep last KEEP_RECENT detailed."""
-    # Find all (assistant_idx, tool_idx) pairs
-    pairs = []
-    i = 0
-    while i < len(messages):
-        msg = messages[i]
-        if msg.get("role") == "assistant" and msg.get("tool_calls"):
-            # Collect following tool messages that belong to this assistant turn
-            tc_ids = {tc["id"] for tc in msg["tool_calls"]}
-            tool_indices = []
-            for j in range(i + 1, len(messages)):
-                if messages[j].get("role") == "tool" and messages[j].get("tool_call_id") in tc_ids:
-                    tool_indices.append(j)
-                elif messages[j].get("role") != "tool":
-                    break
-            if tool_indices:
-                pairs.append((i, tool_indices))
-        i += 1
-
-    if len(pairs) <= KEEP_RECENT:
-        return messages
-
-    # Pairs to compact (all except last KEEP_RECENT)
-    to_compact = pairs[:-KEEP_RECENT]
-    remove_indices = set()
-    for ast_idx, tool_idxs in to_compact:
-        ast_msg = messages[ast_idx]
-        # Build compact summary from tool_calls + results
-        parts = []
-        for tc in ast_msg.get("tool_calls", []):
-            name = tc["function"]["name"]
-            args = tc["function"].get("arguments", "")
-            # Find matching tool result
-            result = ""
-            for tidx in tool_idxs:
-                if messages[tidx].get("tool_call_id") == tc["id"]:
-                    result = messages[tidx].get("content", "")[:10]
-                    break
-            parts.append(f"[{name}({args[:60]})] → \n{result}")
-        # Replace assistant message with compact version
-        summary = "; ".join(parts)
-        original_content = ast_msg.get("content") or ""
-        if original_content:
-            summary = original_content[:80] + "\n" + summary
-        messages[ast_idx] = {"role": "assistant", "content": summary}
-        # Mark tool messages for removal
-        remove_indices.update(tool_idxs)
-
-    # Remove old tool messages
-    return [m for i, m in enumerate(messages) if i not in remove_indices]
-
-
-def estimate_tokens(messages: list) -> int:
-    """Rough token count: ~4 chars per token."""
-    return len(str(messages)) // 4
-
-# auto compact
-def auto_compact(messages: list) -> list:
-    # Save full transcript to disk
-    TRANSCRIPT_DIR.mkdir(exist_ok=True)
-    transcript_path = TRANSCRIPT_DIR / f"transcript_{int(time.time())}.jsonl"
-    with open(transcript_path, "w") as f:
-        for msg in messages:
-            f.write(json.dumps(msg, default=str) + "\n")
-    print(f"[transcript saved: {transcript_path}]")
-    # Ask LLM to summarize
-    conversation_text = json.dumps(messages, default=str)[:80000]
-    prompt = """
-        Summarize this conversation for continuity. Include: 
-        1) What was accomplished, 
-        2) Current state, 
-        3) Key decisions made. 
-        Be concise but preserve critical details.\n\n
-    """
-    response = call_llm(messages, prompt + conversation_text, [])
-    summary = response.get("content")
-    # Replace all messages with compressed summary
-    return [
-        {"role": "user", "content": f"[Conversation compressed. Transcript: {transcript_path}]\n\n{summary}"},
-        {"role": "assistant", "content": "Understood. I have the context from the summary. Continuing."},
-    ]
-
 def agent_loop(messages, system_prompt):
-     while True:
-        messages = micro_compact(messages)
-        if estimate_tokens(messages) > THRESHOLD:
-            print("[auto_compact triggered]")
-            messages[:] = auto_compact(messages)
-        
+    while True:
         response = call_llm(messages, system_prompt, TOOLS)
         content = response.get("content")
         if content:
@@ -334,7 +370,6 @@ def agent_loop(messages, system_prompt):
             dump_conv_log(messages, system_prompt)
             return
         messages.append(response)
-        manual_compact = False
         for tc in tool_calls:
             name = tc["function"]["name"]
             args = json.loads(tc["function"].get("arguments", "{}"))
@@ -347,20 +382,12 @@ def agent_loop(messages, system_prompt):
                     result = tool(**args)
                 except Exception as e:
                     result = f"Error: {e}"
-            if name == "compact":
-                manual_compact = True
             print(f"   → {result[:100]}")
-            messages.append({"role": "tool", "tool_call_id": tc["id"], "content": result})  
-        
-        # Layer 3: manual compact triggered by the compact tool
-        if manual_compact:
-            print("[manual compact]")
-            messages[:] = auto_compact(messages)
-        dump_conv_log(messages, system_prompt)
+            messages.append({"role": "tool", "tool_call_id": tc["id"], "content": result})
 
 
 if __name__ == "__main__":
-    history = []
+    messages = []
 
     while True:
         try:
@@ -372,7 +399,8 @@ if __name__ == "__main__":
         if user_input in ("/q", "exit"):
             break
 
-        history.append({"role": "user", "content": user_input})
-        agent_loop(history, SYSTEM)
+        messages.append({"role": "user", "content": user_input})
+        agent_loop(messages, SYSTEM)
+        dump_conv_log(messages, SYSTEM)
 
     print("\nBye.")
