@@ -5,3 +5,6 @@ node_modules/
 __pycache__
 .transcripts/
 .tasks/
+background_test.txt
+learn-claude-code/agent_debug.log
+learn-claude-code/agent_conv.log
